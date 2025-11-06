@@ -4,61 +4,78 @@ from fastapi import FastAPI, Request, Form
 from fastapi.responses import Response
 from twilio.twiml.voice_response import VoiceResponse, Gather
 from twilio.request_validator import RequestValidator
-import requests
-import openai
+from dotenv import load_dotenv
 from langchain_agent import build_agent
-import json
 
+# Cargar variables del .env
+load_dotenv()
+
+# Crear app FastAPI
 app = FastAPI()
-openai.api_key = os.getenv("OPENAI_API_KEY")
 
-# Crea el agente una vez
+# Configurar claves
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
+
+# Validación de Twilio (opcional pero recomendable)
+TWILIO_VALIDATOR = RequestValidator(TWILIO_AUTH_TOKEN) if TWILIO_AUTH_TOKEN else None
+
+# Crear el agente LangChain
 agent = build_agent()
 
-TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
-TWILIO_VALIDATOR = RequestValidator(TWILIO_AUTH_TOKEN)
-
-# Ruta que Twilio llamará al entrar la llamada
+# ------------------------------------------------------
+# Ruta principal: cuando entra una llamada a tu número
+# ------------------------------------------------------
 @app.post("/twilio/voice")
 async def twilio_voice(request: Request):
-    # Validar webhook (opcional pero recomendado)
-    headers = dict(request.headers)
-    body = await request.form()
-    # (aquí podrías validar la firma con TWILIO_VALIDATOR)
-
-    # Usaremos <Gather> para recoger la intención; alternativa: <Record> para audio completo.
+    """
+    Esta ruta se ejecuta cuando Twilio recibe una llamada.
+    Usamos <Gather> para escuchar lo que el usuario dice.
+    """
     response = VoiceResponse()
-    gather = Gather(input='speech dtmf', action="/twilio/gather", method="POST", timeout=5)
-    gather.say("Hola, gracias por llamar. ¿En qué puedo ayudar? Por ejemplo, 'Quiero una cita el martes a las 10'".encode('utf-8'))
+    gather = Gather(
+        input="speech dtmf",
+        action="/twilio/gather",
+        method="POST",
+        timeout=5
+    )
+    gather.say("Hola, gracias por llamar. ¿En qué puedo ayudarte? Por ejemplo, 'Quiero una cita el martes a las 10'.")
     response.append(gather)
-    response.redirect('/twilio/voice')  # si no hay entrada, repetir
+    response.redirect("/twilio/voice")  # si no hay entrada, repite
     return Response(content=str(response), media_type="application/xml")
 
-# Twilio envía aquí lo recogido por Gather
+# ------------------------------------------------------
+# Ruta donde Twilio manda la respuesta del usuario
+# ------------------------------------------------------
 @app.post("/twilio/gather")
-async def twilio_gather(Request: Request):
-    form = await Request.form()
-    speech_result = form.get("SpeechResult")  # Twilio puede enviar la transcripción si usas speech
-    # Si recolectas raw audio, tendrías que usar <Record> y luego procesar la URL de recording
+async def twilio_gather(request: Request):
+    form = await request.form()
+    speech_result = form.get("SpeechResult")
+
+    response = VoiceResponse()
+
     if not speech_result:
-        # fallback
-        response = VoiceResponse()
-        response.say("No te entendí, repíteme por favor.")
-        response.redirect('/twilio/voice')
+        response.say("No te entendí, ¿podrías repetir por favor?")
+        response.redirect("/twilio/voice")
         return Response(content=str(response), media_type="application/xml")
 
-    # ---> Enviar la transcripción al agente LangChain
-    prompt = f"Cliente: {speech_result}\nAsume que el usuario quiere reservar o preguntar. Responde con acción JSON si quieres crear evento, por ejemplo: {{'action':'create_event', 'data':{{...}}}} o bien responde texto."
-    result = agent.run(prompt)
+    # Enviar lo que el cliente dijo al agente LangChain
+    prompt = (
+        f"Cliente: {speech_result}\n"
+        "Asume que el usuario quiere reservar o preguntar algo. "
+        "Responde con acción JSON si quieres crear evento, por ejemplo: "
+        "{'action':'create_event','data':{...}} o responde texto normal."
+    )
 
-    # Intent: si LangChain devolvió instrucción para crear evento, parsea y llama a la herramienta
-    # (en este ejemplo asumimos que el agente ya llamó a la herramienta. Si no, parseamos result.)
-    response = VoiceResponse()
-    # Simple: si en result aparece 'Evento creado' decimos al usuario que está OK
-    if "Evento creado" in result or "evento creado" in result.lower() or "created" in result.lower():
-        response.say("Perfecto. He creado la cita. Te envío confirmación.")
+    try:
+        result = agent.run(prompt)
+    except Exception as e:
+        result = f"Error procesando la solicitud: {e}"
+
+    # Procesar la respuesta del agente
+    if "evento" in result.lower() or "created" in result.lower():
+        response.say("Perfecto. He creado la cita. Te enviaré confirmación.")
     else:
-        # devolver la respuesta conversacional
         response.say(result)
+
     return Response(content=str(response), media_type="application/xml")
-#app.py
